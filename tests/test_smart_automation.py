@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from storage import open_db, init_db, detect_cycle, recompute_readiness
 from graph import validate_edges
-from calendar import has_free_slot
+from ics_calendar import has_free_slot
 import tempfile
 import os
 

@@ -11,18 +11,24 @@ Design locked after red-team F1-F4:
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 import uuid
 
-# Relative imports work when loaded as a plugin package; fall back for tests.
+# Doctor/loader may import this file without the plugin dir on sys.path.
+_plugin_dir = os.path.dirname(os.path.abspath(__file__))
+if _plugin_dir not in sys.path:
+    sys.path.insert(0, _plugin_dir)
+
 try:
     from .storage import init_db, open_db, recompute_readiness, detect_cycle
     from .graph import validate_edges
-    from .calendar import has_free_slot
+    from .ics_calendar import has_free_slot
 except ImportError:
     from storage import init_db, open_db, recompute_readiness, detect_cycle
     from graph import validate_edges
-    from calendar import has_free_slot
+    from ics_calendar import has_free_slot
 
 _ctx = None  # captured at register() for tool handlers
 
@@ -115,10 +121,12 @@ def handle_graph(args=None, **kw):
 
 
 def handle_trigger_chain(args=None, **kw):
-    """Manual chain advance (F1 fix). Verifies deps succeeded, optionally
-    checks calendar rule, marks job running. Does NOT execute the cron job
-    itself — the agent runs the underlying cronjob via the normal tool path
-    so approvals fire."""
+    """Manual chain advance (F1 fix). Idempotent + concurrent-safe:
+    - duplicate trigger on running/succeeded job fails (no double unlock)
+    - BEGIN IMMEDIATE serializes concurrent triggers in SQLite
+    - dependent jobs unlock ONLY on verified success (never on running)
+    Does NOT execute the cron job itself — agent runs cron via normal tool path.
+    """
     args = args or {}
     job_id = args.get("job_id")
     verified_success = bool(args.get("verified_success"))
@@ -126,31 +134,65 @@ def handle_trigger_chain(args=None, **kw):
         return json.dumps({"ok": False, "error": "job_id is required"})
     conn = _db()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         if not row:
+            conn.rollback()
             return json.dumps({"ok": False, "error": f"unknown job {job_id!r}"})
+        cur_status = row["status"]
+        # Idempotency / duplicate-trigger guard
+        if cur_status == "running" and not verified_success:
+            conn.rollback()
+            return json.dumps({"ok": False, "error": f"job {job_id!r} already running — duplicate trigger ignored", "status": cur_status})
+        # running + verified_success=True is the legitimate completion path (below)
+        if cur_status == "succeeded":
+            conn.rollback()
+            return json.dumps({"ok": False, "error": f"job {job_id!r} already succeeded — duplicate trigger ignored (no double unlock)", "status": cur_status})
+        if cur_status not in ("pending", "ready", "failed", "running"):
+            conn.rollback()
+            return json.dumps({"ok": False, "error": f"job {job_id!r} status {cur_status!r} is not triggerable", "status": cur_status})
+        if cur_status == "pending":
+            # Only ready jobs (deps succeeded) may advance; pending means deps not met
+            conn.rollback()
+            return json.dumps({"ok": False, "error": f"job {job_id!r} is not ready (status=pending) — dependency not satisfied", "status": cur_status})
         dep = row["depends_on"]
         if dep:
             dep_row = conn.execute("SELECT status FROM jobs WHERE job_id=?", (dep,)).fetchone()
             if not dep_row or dep_row["status"] != "succeeded":
+                conn.rollback()
                 return json.dumps({"ok": False, "error": f"blocked: dependency {dep!r} has not succeeded (status={dep_row['status'] if dep_row else 'missing'})"})
         if row["status"] == "paused":
+            conn.rollback()
             return json.dumps({"ok": False, "error": f"job {job_id!r} is paused — resume via orchestrator tools, not Desktop POST"})
         if row["calendar_rule"] and args.get("after_iso"):
             free, warn = has_free_slot(row["calendar_rule"], args["after_iso"])
             if not free:
+                conn.rollback()
                 return json.dumps({"ok": False, "error": warn or "calendar busy"})
         if verified_success:
-            conn.execute("UPDATE jobs SET status='succeeded', last_run_at=?, last_result='verified_success' WHERE job_id=?", (_now(), job_id))
-            chain_id = row["chain_id"]
+            conn.execute("UPDATE jobs SET status='succeeded', last_run_at=?, last_result='verified_success' WHERE job_id=? AND status IN ('ready','running')", (_now(), job_id))
         else:
-            conn.execute("UPDATE jobs SET status='running', last_run_at=? WHERE job_id=?", (_now(), job_id))
-            chain_id = row["chain_id"]
+            conn.execute("UPDATE jobs SET status='running', last_run_at=? WHERE job_id=? AND status='ready'", (_now(), job_id))
+        # Re-read after conditional UPDATE — if another trigger raced us, rowcount is 0
+        if conn.execute("SELECT changes()").fetchone()[0] == 0:
+            conn.rollback()
+            return json.dumps({"ok": False, "error": f"job {job_id!r} was concurrently triggered — duplicate ignored"})
+        chain_id = row["chain_id"]
         conn.commit()
-        unlocked = recompute_readiness(conn, chain_id) if verified_success else []
+        # Readiness recompute in its own transaction (unlocks dependents only on success)
+        unlocked = []
+        if verified_success:
+            conn2 = _db()
+            try:
+                unlocked = recompute_readiness(conn2, chain_id)
+            finally:
+                conn2.close()
         return json.dumps({"ok": True, "job_id": job_id, "status": "succeeded" if verified_success else "running", "unlocked": unlocked})
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- hooks
@@ -174,9 +216,22 @@ def _on_post_tool_call(tool_name="", args=None, **kwargs):
 
 
 def _on_session_start(**kwargs):
+    """Restart recovery: any job left 'running' at process start was interrupted.
+    Reset to 'ready' (deps already satisfied) so the user can explicitly re-trigger.
+    Never auto-unlocks dependents. Records recovery count in meta."""
     try:
         conn = _db()
-        conn.close()
+        try:
+            cur = conn.execute("UPDATE jobs SET status='ready', last_result='recovered_after_restart' WHERE status='running'")
+            n = cur.rowcount
+            if n:
+                conn.execute(
+                    "INSERT INTO meta(key,value) VALUES('last_recovery',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (f"{_now()}:{n}:running->ready",),
+                )
+            conn.commit()
+        finally:
+            conn.close()
     except Exception:
         pass
 
