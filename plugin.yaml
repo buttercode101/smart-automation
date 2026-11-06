@@ -1,5 +1,6 @@
 name: smart-automation
 version: 0.1.0
+requires_hermes: ">=0.22.0"
 description: "Visual, dependency-aware orchestration timeline on top of Hermes cron. Manual chain-runner: jobs advance only via explicit orchestrator_trigger_chain after verified success. Read-only Desktop timeline; all mutations go through agent tools so approvals fire."
 author: Rama (Loopii)
 provides_tools:
